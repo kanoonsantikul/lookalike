@@ -1,18 +1,24 @@
 import os
 import shutil
 import argparse
-from PIL import Image
-from tqdm import tqdm
-import numpy as np
 from collections import defaultdict
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
 from sklearn.cluster import DBSCAN
 
 import torch
-import torchvision.transforms as transforms
-import torchvision.models as models
+from torchvision import models
+from torchvision.models import ResNet50_Weights
 
 # -------------------------------
-# Set custom torch.hub cache dir
+# Config & Device Setup
+# -------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device: {device}")
+
+# -------------------------------
+# Torch Hub Cache Setup
 # -------------------------------
 def set_torch_cache_dir(path):
     if path:
@@ -20,92 +26,93 @@ def set_torch_cache_dir(path):
         print(f"[INFO] Torch cache directory set to: {path}")
 
 # -------------------------------
-# Feature extractor using ResNet
+# Feature Extractor Setup
 # -------------------------------
-def get_feature_extractor():
-    weights = models.ResNet50_Weights.DEFAULT
+def load_model():
+    weights = ResNet50_Weights.DEFAULT
     model = models.resnet50(weights=weights)
-    model = torch.nn.Sequential(*(list(model.children())[:-1]))  # remove final layer
+    model = torch.nn.Sequential(*list(model.children())[:-1])  # remove final FC
+    model.to(device)
     model.eval()
     return model, weights.transforms()
 
 # -------------------------------
-# Preprocess image using model's transform
-# -------------------------------
-def preprocess_image(image_path, transform):
-    image = Image.open(image_path).convert('RGB')
-    return transform(image).unsqueeze(0)
-
-# -------------------------------
-# Load images and compute features
+# Feature Extraction
 # -------------------------------
 def extract_features(image_paths, model, transform):
     features = []
     with torch.no_grad():
         for path in tqdm(image_paths, desc="Extracting features"):
-            img_tensor = preprocess_image(path, transform)
-            feature = model(img_tensor).squeeze().numpy()
-            features.append(feature)
+            try:
+                image = Image.open(path).convert('RGB')
+                tensor = transform(image).unsqueeze(0).to(device)
+                output = model(tensor).squeeze().cpu().numpy()
+                features.append(output)
+            except Exception as e:
+                print(f"[WARN] Failed to process {path}: {e}")
+                features.append(np.zeros(2048))  # fallback to zeros if broken
     return np.array(features)
 
 # -------------------------------
-# Cluster and organize images
+# Clustering & Copying Files
 # -------------------------------
-def cluster_and_copy(image_paths, features, output_dir, eps=5, min_samples=2):
+def cluster_images(image_paths, features, output_dir, eps, min_samples):
     clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean').fit(features)
     labels = clustering.labels_
 
     num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    print(f"Found {num_clusters} clusters.")
+    print(f"[INFO] Found {num_clusters} clusters.")
 
-    label_to_paths = defaultdict(list)
+    grouped = defaultdict(list)
     for path, label in zip(image_paths, labels):
-        label_to_paths[label].append(path)
+        grouped[label].append(path)
 
-    for label, paths in tqdm(label_to_paths.items(), desc="Copying grouped images"):
-        label_dir = "unclustered" if label == -1 else f"cluster_{label}"
-        save_dir = os.path.join(output_dir, label_dir)
-        os.makedirs(save_dir, exist_ok=True)
-
+    for label, paths in tqdm(grouped.items(), desc="Copying grouped images"):
+        subfolder = "unclustered" if label == -1 else f"cluster_{label}"
+        target_dir = os.path.join(output_dir, subfolder)
+        os.makedirs(target_dir, exist_ok=True)
         for path in paths:
-            shutil.copy(path, save_dir)
+            shutil.copy(path, target_dir)
 
 # -------------------------------
-# Main function
+# Main Pipeline
 # -------------------------------
-def main(input_dir, output_dir, eps=5.0, min_samples=2, cache_dir=None):
+def lookalike(input_dir, output_dir, eps, min_samples, cache_dir):
     if cache_dir is None:
         cache_dir = os.path.join(os.getcwd(), ".lookalike_cache")
-        print(f"[INFO] No --cache specified. Using default cache dir: {cache_dir}")
+        print(f"[INFO] No --cache specified. Using default: {cache_dir}")
     else:
-        print(f"[INFO] Using specified cache dir: {cache_dir}")
-
+        print(f"[INFO] Using specified cache directory: {cache_dir}")
     os.makedirs(cache_dir, exist_ok=True)
     set_torch_cache_dir(cache_dir)
 
-    image_paths = [os.path.join(input_dir, fname) for fname in os.listdir(input_dir)
-                   if fname.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    image_paths = [
+        os.path.join(input_dir, f)
+        for f in os.listdir(input_dir)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ]
 
     if not image_paths:
-        print("No images found in input directory.")
+        print("[ERROR] No images found.")
         return
 
-    model, transform = get_feature_extractor()
+    model, transform = load_model()
     features = extract_features(image_paths, model, transform)
-    cluster_and_copy(image_paths, features, output_dir, eps, min_samples)
-
-    print(f"[DONE] Organized {len(image_paths)} images into '{output_dir}'.")
+    cluster_images(image_paths, features, output_dir, eps, min_samples)
+    print(f"[DONE] Organized {len(image_paths)} images into: {output_dir}")
 
 # -------------------------------
-# CLI entry point
+# CLI Entry Point
 # -------------------------------
-if __name__ == "__main__":
+def parse_args():
     parser = argparse.ArgumentParser(description="Lookalike: Organize similar photos using AI.")
-    parser.add_argument('--input', type=str, required=True, help='Path to input image folder')
-    parser.add_argument('--output', type=str, default='output', help='Path to output folder')
-    parser.add_argument('--eps', type=float, default=5.0, help='DBSCAN eps value (distance threshold)')
-    parser.add_argument('--min_samples', type=int, default=2, help='DBSCAN min_samples value')
-    parser.add_argument('--cache', type=str, default=None, help='Path to torch hub cache directory')
+    parser.add_argument('--input', required=True, help='Path to input folder')
+    parser.add_argument('--output', default='output', help='Path to save clustered images')
+    parser.add_argument('--eps', type=float, default=5.0, help='DBSCAN eps (distance threshold)')
+    parser.add_argument('--min_samples', type=int, default=2, help='Minimum samples per cluster')
+    parser.add_argument('--cache', type=str, help='Path to torch hub cache directory')
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    main(args.input, args.output, args.eps, args.min_samples, args.cache)
+if __name__ == "__main__":
+    args = parse_args()
+    lookalike(args.input, args.output, args.eps, args.min_samples, args.cache)
