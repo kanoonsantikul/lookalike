@@ -23,33 +23,27 @@ def set_torch_cache_dir(path):
 # Feature extractor using ResNet
 # -------------------------------
 def get_feature_extractor():
-    model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+    weights = models.ResNet50_Weights.DEFAULT
+    model = models.resnet50(weights=weights)
     model = torch.nn.Sequential(*(list(model.children())[:-1]))  # remove final layer
     model.eval()
-    return model
+    return model, weights.transforms()
 
 # -------------------------------
-# Preprocess image for ResNet
+# Preprocess image using model's transform
 # -------------------------------
-def preprocess_image(image_path):
+def preprocess_image(image_path, transform):
     image = Image.open(image_path).convert('RGB')
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        ),
-    ])
     return transform(image).unsqueeze(0)
 
 # -------------------------------
 # Load images and compute features
 # -------------------------------
-def extract_features(image_paths, model):
+def extract_features(image_paths, model, transform):
     features = []
     with torch.no_grad():
         for path in tqdm(image_paths, desc="Extracting features"):
-            img_tensor = preprocess_image(path)
+            img_tensor = preprocess_image(path, transform)
             feature = model(img_tensor).squeeze().numpy()
             features.append(feature)
     return np.array(features)
@@ -96,10 +90,11 @@ def main(input_dir, output_dir, eps=5.0, min_samples=2, cache_dir=None):
         print("No images found in input directory.")
         return
 
-    model = get_feature_extractor()
-    features = extract_features(image_paths, model)
+    model, transform = get_feature_extractor()
+    features = extract_features(image_paths, model, transform)
     cluster_and_copy(image_paths, features, output_dir, eps, min_samples)
 
+    print(f"[DONE] Organized {len(image_paths)} images into '{output_dir}'.")
 
 # -------------------------------
 # CLI entry point
