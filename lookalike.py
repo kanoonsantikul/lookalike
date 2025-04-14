@@ -29,7 +29,7 @@ def set_torch_cache_dir(path):
 # Load DINOv2 Model
 # -------------------------------
 def load_dinov2():
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').to(device)
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14").to(device)
     model.eval()
     transform = T.Compose([
         T.Resize(224),
@@ -68,27 +68,47 @@ def reduce_features(features, n_components=100):
 # -------------------------------
 # Clustering & Copying
 # -------------------------------
-def cluster_images(image_paths, features, output_dir, eps, min_samples):
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine').fit(features)
+def cluster_images(image_paths, features, output_dir, eps, min_samples, prefix):
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine").fit(features)
     labels = clustering.labels_
+
     num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     print(f"[INFO] Found {num_clusters} clusters.")
 
     grouped = defaultdict(list)
-    for path, label in zip(image_paths, labels):
-        grouped[label].append(path)
+    for path, label, feature in zip(image_paths, labels, features):
+        grouped[label].append((path, feature))
 
-    for label, paths in tqdm(grouped.items(), desc="Copying grouped images"):
-        subfolder = "unclustered" if label == -1 else f"cluster_{label}"
-        target_dir = os.path.join(output_dir, subfolder)
-        os.makedirs(target_dir, exist_ok=True)
-        for path in paths:
-            shutil.copy(path, target_dir)
+    # Sort clusters and sort images inside each cluster by similarity to centroid
+    ordered_paths = []
+    for label in sorted(grouped.keys()):
+        group = grouped[label]
+        if len(group) == 1:
+            ordered_paths.append(group[0][0])
+            continue
+
+        paths, feats = zip(*group)
+        feats = np.stack(feats)
+        centroid = feats.mean(axis=0)
+        distances = np.linalg.norm(feats - centroid, axis=1)
+        sorted_indices = np.argsort(distances)
+        ordered_paths.extend([paths[i] for i in sorted_indices])
+
+    # Rename and copy
+    total = len(ordered_paths)
+    padding = len(str(total))
+    os.makedirs(output_dir, exist_ok=True)
+
+    for idx, path in tqdm(enumerate(ordered_paths, start=1), total=total, desc="Renaming grouped images"):
+        ext = os.path.splitext(path)[1].lower()
+        new_filename = f"{prefix}{str(idx).zfill(padding)}{ext}"
+        target_path = os.path.join(output_dir, new_filename)
+        shutil.copy(path, target_path)
 
 # -------------------------------
 # Main Pipeline
 # -------------------------------
-def lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca):
+def lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca, prefix):
     if cache_dir is None:
         cache_dir = os.path.join(os.getcwd(), ".lookalike_cache")
         print(f"[INFO] No --cache specified. Using default: {cache_dir}")
@@ -98,7 +118,7 @@ def lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca):
     image_paths = [
         os.path.join(input_dir, f)
         for f in os.listdir(input_dir)
-        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
     ]
 
     if not image_paths:
@@ -112,7 +132,7 @@ def lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca):
         print("[INFO] Reduce features using PCA")
         features = reduce_features(features, n_components=100)
 
-    cluster_images(image_paths, features, output_dir, eps, min_samples)
+    cluster_images(image_paths, features, output_dir, eps, min_samples, prefix)
     print(f"[DONE] Organized {len(image_paths)} images into: {output_dir}")
 
 # -------------------------------
@@ -120,14 +140,15 @@ def lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca):
 # -------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Lookalike: Group similar photos using DINOv2 visual embeddings.")
-    parser.add_argument('--input', required=True, help='Input image folder')
-    parser.add_argument('--output', default='output', help='Output folder')
-    parser.add_argument('--eps', type=float, default=0.3, help='DBSCAN eps (cosine distance threshold)')
-    parser.add_argument('--min_samples', type=int, default=2, help='Minimum samples per cluster')
-    parser.add_argument('--cache', type=str, help='Path to torch hub cache directory')
-    parser.add_argument('--use_pca', action='store_true', help='Apply PCA before clustering')
+    parser.add_argument("--input", required=True, help="Input image folder")
+    parser.add_argument("--output", default="output", help="Output folder")
+    parser.add_argument("--eps", type=float, default=0.3, help="DBSCAN eps (cosine distance threshold)")
+    parser.add_argument("--min_samples", type=int, default=2, help="Minimum samples per cluster")
+    parser.add_argument("--cache", type=str, help="Path to torch hub cache directory")
+    parser.add_argument("--use_pca", action="store_true", help="Apply PCA before clustering")
+    parser.add_argument("--prefix", type=str, default="cluster", help="Prefix for renamed output files")
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    lookalike(args.input, args.output, args.eps, args.min_samples, args.cache, args.use_pca)
+    lookalike(args.input, args.output, args.eps, args.min_samples, args.cache, args.use_pca, args.prefix)
