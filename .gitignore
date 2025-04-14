@@ -1,0 +1,7 @@
+.lookalike_cache/
+__pycache__/
+*.pyc
+.env
+.venv/
+Pipfile.lock
+
