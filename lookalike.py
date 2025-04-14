@@ -1,33 +1,37 @@
 import os
 import shutil
 import argparse
+import csv
 from collections import defaultdict
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
+
 import torch
 import torchvision.transforms as transforms
 
 # -------------------------------
-# Device & Torch Cache Setup
+# Config & Device Setup
 # -------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {device}")
 
-def set_torch_hub_cache_dir(cache_path):
+# -------------------------------
+# Torch Hub Cache Setup
+# -------------------------------
+def set_torch_cache_dir(cache_path):
     if cache_path:
         torch.hub.set_dir(cache_path)
         print(f"[INFO] Torch hub cache directory set to: {cache_path}")
 
 # -------------------------------
-# Load DINOv2 Model & Transform
+# Load DINOv2 Model
 # -------------------------------
 def load_dinov2_model():
     model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14").to(device)
     model.eval()
-
     transform = transforms.Compose([
         transforms.Resize(224),
         transforms.CenterCrop(224),
@@ -38,90 +42,89 @@ def load_dinov2_model():
     return model, transform
 
 # -------------------------------
-# Extract Image Features
+# Extract Visual Features
 # -------------------------------
-def extract_image_features(image_paths, model, transform):
-    feature_vectors = []
+def extract_visual_features(image_paths, model, transform):
+    features = []
     with torch.no_grad():
-        for path in tqdm(image_paths, desc="Extracting image features"):
+        for image_path in tqdm(image_paths, desc="Extracting image features"):
             try:
-                image = Image.open(path).convert("RGB")
-                input_tensor = transform(image).unsqueeze(0).to(device)
-                output = model(input_tensor)
-                feature_vectors.append(output.squeeze().cpu().numpy())
-            except Exception as error:
-                print(f"[WARN] Failed to process {path}: {error}")
-                feature_vectors.append(np.zeros(384))  # fallback for DINOv2 ViT-S/14
-    return np.array(feature_vectors)
+                image = Image.open(image_path).convert("RGB")
+                tensor = transform(image).unsqueeze(0).to(device)
+                output = model(tensor)
+                features.append(output.squeeze().cpu().numpy())
+            except Exception as e:
+                print(f"[WARN] Failed to process {image_path}: {e}")
+                features.append(np.zeros(384))  # fallback for ViT-S/14
+    return np.array(features)
 
 # -------------------------------
 # Dimensionality Reduction
 # -------------------------------
-def apply_pca(feature_vectors, num_components=100):
-    print(f"[INFO] Reducing features to {num_components} dimensions using PCA...")
-    pca = PCA(n_components=num_components)
-    return pca.fit_transform(feature_vectors)
+def apply_pca(features, components=100):
+    print(f"[INFO] Reducing features to {components} dimensions using PCA...")
+    pca = PCA(n_components=components)
+    return pca.fit_transform(features)
 
 # -------------------------------
-# Intra-cluster Similarity Sort
+# Cluster and Sort Images
 # -------------------------------
-def sort_cluster_by_similarity(image_paths, feature_vectors):
-    if not image_paths:
-        return []
-
-    remaining = list(zip(image_paths, feature_vectors))
-    sorted_paths = []
-
-    # Start from image with oldest modified time
-    first_path = min(remaining, key=lambda x: os.path.getmtime(x[0]))
-    sorted_paths.append(first_path[0])
-    remaining.remove(first_path)
-
-    last_vector = first_path[1]
-    while remaining:
-        next_path, next_vector = min(
-            remaining, key=lambda x: np.dot(last_vector, x[1]) / (np.linalg.norm(last_vector) * np.linalg.norm(x[1]) + 1e-8)
-        )
-        sorted_paths.append(next_path)
-        last_vector = next_vector
-        remaining.remove((next_path, next_vector))
-
-    return sorted_paths
-
-# -------------------------------
-# Cluster Images & Rename
-# -------------------------------
-def cluster_and_rename_images(image_paths, feature_vectors, output_dir, eps, min_samples, file_prefix):
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine").fit(feature_vectors)
+def cluster_and_rename_images(image_paths, features, output_dir, eps, min_samples, file_prefix, log_path):
+    clustering = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine").fit(features)
     labels = clustering.labels_
 
     num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     print(f"[INFO] Found {num_clusters} clusters.")
 
-    clusters = defaultdict(list)
-    for path, label, vector in zip(image_paths, labels, feature_vectors):
-        clusters[label].append((path, vector))
+    cluster_map = defaultdict(list)
+    for path, label in zip(image_paths, labels):
+        cluster_map[label].append(path)
 
-    ordered_image_paths = []
-    for label in sorted(clusters.keys()):
-        cluster_items = clusters[label]
-        sorted_cluster_paths = sort_cluster_by_similarity(
-            [p for p, _ in cluster_items], [v for _, v in cluster_items]
-        )
-        ordered_image_paths.extend(sorted_cluster_paths)
+    # Sort within each cluster by similarity from oldest file
+    ordered_paths = []
+    log_entries = []
+    for cluster_label in sorted(cluster_map.keys()):
+        cluster_files = cluster_map[cluster_label]
+        if not cluster_files:
+            continue
 
+        cluster_features = [features[image_paths.index(p)] for p in cluster_files]
+        base_index = np.argmin([os.path.getctime(p) for p in cluster_files])
+        ordered = [cluster_files[base_index]]
+        remaining = list(range(len(cluster_files)))
+        remaining.remove(base_index)
+
+        while remaining:
+            last = ordered[-1]
+            last_feat = cluster_features[cluster_files.index(last)]
+            similarities = [np.dot(last_feat, cluster_features[i]) / (
+                np.linalg.norm(last_feat) * np.linalg.norm(cluster_features[i]) + 1e-5)
+                for i in remaining]
+            next_index = remaining[np.argmax(similarities)]
+            ordered.append(cluster_files[next_index])
+            remaining.remove(next_index)
+
+        ordered_paths.extend([(path, cluster_label) for path in ordered])
+
+    # Rename and copy files
     os.makedirs(output_dir, exist_ok=True)
-    total_images = len(ordered_image_paths)
-    padding = len(str(total_images))
+    padding = len(str(len(ordered_paths)))
 
-    for index, original_path in tqdm(enumerate(ordered_image_paths, start=1), total=total_images, desc="Renaming images"):
+    for index, (original_path, cluster_label) in tqdm(enumerate(ordered_paths, start=1), total=len(ordered_paths), desc="Renaming clustered images"):
         extension = os.path.splitext(original_path)[1].lower()
         new_name = f"{file_prefix}{str(index).zfill(padding)}{extension}"
         target_path = os.path.join(output_dir, new_name)
         shutil.copy(original_path, target_path)
+        log_entries.append((original_path, new_name, cluster_label))
+
+    # Write CSV log
+    with open(log_path, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["original_path", "new_filename", "cluster_label"])
+        writer.writerows(log_entries)
 
 # -------------------------------
-# Copy & Rename Videos
+# Copy and Rename Videos
 # -------------------------------
 def copy_and_rename_videos(video_paths, output_dir, file_prefix):
     total_videos = len(video_paths)
@@ -130,39 +133,53 @@ def copy_and_rename_videos(video_paths, output_dir, file_prefix):
 
     for index, video_path in tqdm(enumerate(video_paths, start=1), total=total_videos, desc="Copying videos"):
         extension = os.path.splitext(video_path)[1].lower()
-        new_name = f"{file_prefix}{str(index).zfill(padding)}_vid{extension}"
+        new_name = f"vid_{file_prefix}{str(index).zfill(padding)}{extension}"
         target_path = os.path.join(output_dir, new_name)
         shutil.copy(video_path, target_path)
 
 # -------------------------------
-# Main Execution Pipeline
+# Main Pipeline
 # -------------------------------
-def run_lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca, file_prefix):
+def run_lookalike_pipeline(input_dir, output_dir, eps, min_samples, cache_dir, use_pca, file_prefix):
     if cache_dir is None:
         cache_dir = os.path.join(os.getcwd(), ".lookalike_cache")
+        print(f"[INFO] No --cache specified. Using default: {cache_dir}")
     os.makedirs(cache_dir, exist_ok=True)
-    set_torch_hub_cache_dir(cache_dir)
+    set_torch_cache_dir(cache_dir)
 
-    all_file_paths = [
-        os.path.join(input_dir, file_name)
-        for file_name in os.listdir(input_dir)
-    ]
-    image_paths = [f for f in all_file_paths if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    video_paths = [f for f in all_file_paths if f.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))]
+    image_paths = []
+    video_paths = []
+    for filename in os.listdir(input_dir):
+        full_path = os.path.join(input_dir, filename)
+        if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            image_paths.append(full_path)
+        elif filename.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+            video_paths.append(full_path)
 
-    if not image_paths and not video_paths:
-        print("[ERROR] No images or videos found in input directory.")
-        return
+    if not image_paths:
+        print("[WARN] No images found in input folder.")
 
+    if not video_paths:
+        print("[WARN] No video files found in input folder.")
+
+    # Process images
     if image_paths:
         model, transform = load_dinov2_model()
-        feature_vectors = extract_image_features(image_paths, model, transform)
-
+        features = extract_visual_features(image_paths, model, transform)
         if use_pca:
-            feature_vectors = apply_pca(feature_vectors)
+            features = apply_pca(features, components=100)
 
-        cluster_and_rename_images(image_paths, feature_vectors, output_dir, eps, min_samples, file_prefix)
+        cluster_and_rename_images(
+            image_paths,
+            features,
+            output_dir,
+            eps,
+            min_samples,
+            file_prefix,
+            os.path.join(output_dir, "log.csv")
+        )
 
+    # Process videos
     if video_paths:
         copy_and_rename_videos(video_paths, output_dir, file_prefix)
 
@@ -171,17 +188,25 @@ def run_lookalike(input_dir, output_dir, eps, min_samples, cache_dir, use_pca, f
 # -------------------------------
 # CLI Entry Point
 # -------------------------------
-def parse_command_line_arguments():
-    parser = argparse.ArgumentParser(description="Lookalike: Cluster and sort images/videos by visual similarity.")
-    parser.add_argument("--input", required=True, help="Input directory with images and videos")
-    parser.add_argument("--output", default="output", help="Output directory for renamed files")
+def parse_cli_arguments():
+    parser = argparse.ArgumentParser(description="Lookalike: Group similar images and copy videos using DINOv2 features.")
+    parser.add_argument("--input", required=True, help="Input folder with images and videos")
+    parser.add_argument("--output", default="output", help="Output folder")
     parser.add_argument("--eps", type=float, default=0.3, help="DBSCAN eps (cosine distance threshold)")
-    parser.add_argument("--min_samples", type=int, default=2, help="Minimum samples per DBSCAN cluster")
+    parser.add_argument("--min_samples", type=int, default=2, help="Minimum samples per cluster")
     parser.add_argument("--cache", type=str, help="Path to torch hub cache directory")
-    parser.add_argument("--use_pca", action="store_true", help="Enable PCA dimensionality reduction")
-    parser.add_argument("--prefix", type=str, default="cluster", help="Prefix for renamed files")
+    parser.add_argument("--use_pca", action="store_true", help="Enable PCA reduction before clustering")
+    parser.add_argument("--prefix", type=str, default="cluster", help="Prefix for renamed image/video files")
     return parser.parse_args()
 
 if __name__ == "__main__":
-    args = parse_command_line_arguments()
-    run_lookalike(args.input, args.output, args.eps, args.min_samples, args.cache, args.use_pca, args.prefix)
+    args = parse_cli_arguments()
+    run_lookalike_pipeline(
+        input_dir=args.input,
+        output_dir=args.output,
+        eps=args.eps,
+        min_samples=args.min_samples,
+        cache_dir=args.cache,
+        use_pca=args.use_pca,
+        file_prefix=args.prefix,
+    )
