@@ -75,23 +75,23 @@ def sort_images_by_similarity(image_paths, features):
 
     return [image_paths[i] for i in ordered_indices]
 
-def rename_and_copy_images(image_paths, output_dir, prefix):
+def rename_and_copy_images(image_paths, output_dir, prefix, start_number):
     os.makedirs(output_dir, exist_ok=True)
     padding = len(str(len(image_paths)))
-    for index, image_path in tqdm(enumerate(image_paths, start=1), total=len(image_paths), desc="Renaming images"):
+    for index, image_path in tqdm(enumerate(image_paths, start=start_number), total=len(image_paths), desc="Renaming images"):
         ext = os.path.splitext(image_path)[1].lower()
         new_name = f"{prefix}{str(index).zfill(padding)}{ext}"
         shutil.copy(image_path, os.path.join(output_dir, new_name))
 
-def rename_and_copy_video(video_paths, output_dir, prefix):
+def rename_and_copy_video(video_paths, output_dir, prefix, start_number):
     os.makedirs(output_dir, exist_ok=True)
     padding = len(str(len(video_paths)))
-    for index, video_path in tqdm(enumerate(video_paths, start=1), total=len(video_paths), desc="Renaming videos"):
+    for index, video_path in tqdm(enumerate(video_paths, start=start_number), total=len(video_paths), desc="Renaming videos"):
         ext = os.path.splitext(video_path)[1].lower()
         new_name = f"vid_{prefix}{str(index).zfill(padding)}{ext}"
         shutil.copy(video_path, os.path.join(output_dir, new_name))
 
-def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache):
+def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache, start_number_images, start_number_videos):
     if cache_dir is None:
         cache_dir = os.path.join(os.getcwd(), ".lookalike_cache")
         print(f"[INFO] No --cache specified. Using default: {cache_dir}")
@@ -134,10 +134,10 @@ def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache):
                 f.writelines([p + '\n' for p in image_paths])
 
         sorted_image_paths = sort_images_by_similarity(image_paths, features)
-        rename_and_copy_images(sorted_image_paths, output_dir, prefix)
+        rename_and_copy_images(sorted_image_paths, output_dir, prefix, start_number_images)
 
     if video_paths:
-        rename_and_copy_video(video_paths, output_dir, prefix)
+        rename_and_copy_video(video_paths, output_dir, prefix, start_number_videos)
 
     print(f"[DONE] Finished organizing {len(image_paths)} images and {len(video_paths)} videos to: {output_dir}")
 
@@ -151,6 +151,8 @@ def parse_cli_arguments():
     parser.add_argument("--prefix", type=str, default="cluster", help="Prefix for renamed files")
     parser.add_argument("--cache", type=str, help="Path to cache directory")
     parser.add_argument("--use_cache", action="store_true", help="Use cached features if available")
+    parser.add_argument("--start_number_images", type=int, default=1, help="Starting number for renamed image files")
+    parser.add_argument("--start_number_videos", type=int, default=1, help="Starting number for renamed video files")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -160,5 +162,7 @@ if __name__ == "__main__":
         output_dir=args.output,
         prefix=args.prefix,
         cache_dir=args.cache,
-        use_cache=args.use_cache
+        use_cache=args.use_cache,
+        start_number_images=args.start_number_images,
+        start_number_videos=args.start_number_videos
     )
