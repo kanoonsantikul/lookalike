@@ -129,9 +129,10 @@ def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache, 
             features = np.load(feature_cache_path)
         else:
             features = extract_visual_features(image_paths, model, transform)
-            np.save(feature_cache_path, features)
-            with open(path_cache_path, 'w') as f:
-                f.writelines([p + '\n' for p in image_paths])
+            if use_cache:
+                np.save(feature_cache_path, features)
+                with open(path_cache_path, 'w') as f:
+                    f.writelines([p + '\n' for p in image_paths])
 
         sorted_image_paths = sort_images_by_similarity(image_paths, features)
         rename_and_copy_images(sorted_image_paths, output_dir, prefix, start_number_images)
