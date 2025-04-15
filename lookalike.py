@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.cluster import DBSCAN
 from sklearn.decomposition import PCA
+import hashlib
 
 import torch
 import torchvision.transforms as transforms
@@ -19,12 +20,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {device}")
 
 # -------------------------------
-# Torch Hub Cache Setup
+# Set Lookaloke Cache Directory
 # -------------------------------
-def set_torch_cache_dir(cache_path):
+def set_cache_directory(cache_path):
     if cache_path:
         torch.hub.set_dir(cache_path)
-        print(f"[INFO] Torch hub cache directory set to: {cache_path}")
+        print(f"[INFO] Cache directory set to: {cache_path}")
+
+# -------------------------------
+# Retrieve Path For Features Cache
+# -------------------------------
+def get_cache_paths(input_dir, cache_dir):
+    dir_hash = hashlib.md5(input_dir.encode()).hexdigest()
+    feature_path = os.path.join(cache_dir, f"{dir_hash}_features.npy")
+    list_path = os.path.join(cache_dir, f"{dir_hash}_paths.txt")
+    return feature_path, list_path
 
 # -------------------------------
 # Load DINOv2 Model
@@ -140,16 +150,16 @@ def copy_and_rename_videos(video_paths, output_dir, file_prefix):
 # -------------------------------
 # Main Pipeline
 # -------------------------------
-def run_lookalike_pipeline(input_dir, output_dir, eps, min_samples, cache_dir, use_pca, file_prefix):
+def run_lookalike_pipeline(input_dir, output_dir, eps, min_samples, use_pca, file_prefix, cache_dir, use_cache):
     if cache_dir is None:
         cache_dir = os.path.join(os.getcwd(), ".lookalike_cache")
         print(f"[INFO] No --cache specified. Using default: {cache_dir}")
     os.makedirs(cache_dir, exist_ok=True)
-    set_torch_cache_dir(cache_dir)
+    set_cache_directory(cache_dir)
 
     image_paths = []
     video_paths = []
-    for filename in os.listdir(input_dir):
+    for filename in sorted(os.listdir(input_dir)):
         full_path = os.path.join(input_dir, filename)
         if filename.lower().endswith((".jpg", ".jpeg", ".png")):
             image_paths.append(full_path)
@@ -165,7 +175,25 @@ def run_lookalike_pipeline(input_dir, output_dir, eps, min_samples, cache_dir, u
     # Process images
     if image_paths:
         model, transform = load_dinov2_model()
-        features = extract_visual_features(image_paths, model, transform)
+        feature_cache_path, path_cache_path = get_cache_paths(input_dir, cache_dir)
+        cache_existed = os.path.exists(feature_cache_path) and os.path.exists(path_cache_path)
+
+        if use_cache and cache_existed:
+            print("[INFO] Using cached features...")
+            with open(path_cache_path, 'r') as f:
+                cached_paths = [line.strip() for line in f.readlines()]
+            if cached_paths != image_paths:
+                print("[WARN] Cached paths don't match current input. Recomputing features.")
+                cache_existed = False
+
+        if use_cache and cache_existed:
+            features = np.load(feature_cache_path)
+        else:
+            features = extract_visual_features(image_paths, model, transform)
+            np.save(feature_cache_path, features)
+            with open(path_cache_path, 'w') as f:
+                f.writelines([f"{p}\n" for p in image_paths])
+
         if use_pca:
             features = apply_pca(features, components=100)
 
@@ -194,9 +222,10 @@ def parse_cli_arguments():
     parser.add_argument("--output", default="output", help="Output folder")
     parser.add_argument("--eps", type=float, default=0.3, help="DBSCAN eps (cosine distance threshold)")
     parser.add_argument("--min_samples", type=int, default=2, help="Minimum samples per cluster")
-    parser.add_argument("--cache", type=str, help="Path to torch hub cache directory")
     parser.add_argument("--use_pca", action="store_true", help="Enable PCA reduction before clustering")
     parser.add_argument("--prefix", type=str, default="cluster", help="Prefix for renamed image/video files")
+    parser.add_argument("--cache", type=str, help="Path to torch hub cache directory")
+    parser.add_argument("--use_cache", action="store_true", help="Use cached features if available")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -206,7 +235,8 @@ if __name__ == "__main__":
         output_dir=args.output,
         eps=args.eps,
         min_samples=args.min_samples,
-        cache_dir=args.cache,
         use_pca=args.use_pca,
         file_prefix=args.prefix,
+        cache_dir=args.cache,
+        use_cache=args.use_cache
     )
