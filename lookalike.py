@@ -7,6 +7,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 import torchvision.transforms as transforms
+import heapq
 
 # -------------------------------
 # Config & Device Setup
@@ -91,7 +92,32 @@ def rename_and_copy_video(video_paths, output_dir, prefix, start_number):
         new_name = f"vid_{prefix}{str(index).zfill(padding)}{ext}"
         shutil.copy(video_path, os.path.join(output_dir, new_name))
 
-def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache, start_number_images, start_number_videos):
+def compare_query_image(query_path, image_paths, features, model, transform):
+    try:
+        image = Image.open(query_path).convert("RGB")
+        tensor = transform(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            query_feat = model(tensor).squeeze().cpu().numpy()
+    except Exception as e:
+        print(f"[ERROR] Could not process query image: {e}")
+        return
+
+    similarities = []
+    for img_path, feat in zip(image_paths, features):
+        if np.linalg.norm(feat) < 1e-6:
+            similarity = -1  # bad fallback feature
+        else:
+            similarity = np.dot(query_feat, feat) / (np.linalg.norm(query_feat) * np.linalg.norm(feat) + 1e-8)
+        similarities.append((similarity, img_path))
+
+    top_10 = heapq.nlargest(10, similarities, key=lambda x: x[0])
+
+    print("\n🔍 Top 10 Most Similar Images:")
+    for score, path in top_10:
+        print(f"{score:.4f} - {path}")
+
+def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache,
+                           start_number_images, start_number_videos, query_image=None):
     if cache_dir is None:
         cache_dir = os.path.join(os.getcwd(), ".lookalike_cache")
         print(f"[INFO] No --cache specified. Using default: {cache_dir}")
@@ -134,10 +160,13 @@ def run_lookalike_pipeline(input_dir, output_dir, prefix, cache_dir, use_cache, 
                 with open(path_cache_path, 'w') as f:
                     f.writelines([p + '\n' for p in image_paths])
 
-        sorted_image_paths = sort_images_by_similarity(image_paths, features)
-        rename_and_copy_images(sorted_image_paths, output_dir, prefix, start_number_images)
+        if query_image:
+            compare_query_image(query_image, image_paths, features, model, transform)
+        else:
+            sorted_image_paths = sort_images_by_similarity(image_paths, features)
+            rename_and_copy_images(sorted_image_paths, output_dir, prefix, start_number_images)
 
-    if video_paths:
+    if video_paths and query_image == None:
         rename_and_copy_video(video_paths, output_dir, prefix, start_number_videos)
 
     print(f"[DONE] Finished organizing {len(image_paths)} images and {len(video_paths)} videos to: {output_dir}")
@@ -154,6 +183,7 @@ def parse_cli_arguments():
     parser.add_argument("--use_cache", action="store_true", help="Use cached features if available")
     parser.add_argument("--start_number_images", type=int, default=1, help="Starting number for renamed image files")
     parser.add_argument("--start_number_videos", type=int, default=1, help="Starting number for renamed video files")
+    parser.add_argument("--query_image", type=str, help="Optional image to compare against all images in input folder")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -165,5 +195,6 @@ if __name__ == "__main__":
         cache_dir=args.cache,
         use_cache=args.use_cache,
         start_number_images=args.start_number_images,
-        start_number_videos=args.start_number_videos
+        start_number_videos=args.start_number_videos,
+        query_image=args.query_image
     )
